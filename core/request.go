@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -31,6 +32,8 @@ const DefaultServerAddress = "https://aws-serverless-go-api.com"
 // GetAPIGatewayContext method of the RequestAccessor object.
 const APIGwContextHeader = "X-GoLambdaProxy-ApiGw-Context"
 
+// TODO add constant for ALB context header
+
 // APIGwStageVarsHeader is the custom header key used to store the
 // API Gateway stage variables. To access the stage variable values
 // use the GetAPIGatewayStageVars method of the RequestAccessor object.
@@ -41,6 +44,8 @@ const APIGwStageVarsHeader = "X-GoLambdaProxy-ApiGw-StageVars"
 type RequestAccessor struct {
 	stripBasePath string
 }
+
+// TODO add GetALBRequestContext
 
 // GetAPIGatewayContext extracts the API Gateway context object from a
 // request's custom header.
@@ -53,7 +58,7 @@ func (r *RequestAccessor) GetAPIGatewayContext(req *http.Request) (events.APIGat
 	context := events.APIGatewayProxyRequestContext{}
 	err := json.Unmarshal([]byte(req.Header.Get(APIGwContextHeader)), &context)
 	if err != nil {
-		log.Println("Erorr while unmarshalling context")
+		log.Println("Error while unmarshalling context")
 		log.Println(err)
 		return events.APIGatewayProxyRequestContext{}, err
 	}
@@ -102,36 +107,37 @@ func (r *RequestAccessor) StripBasePath(basePath string) string {
 	return newBasePath
 }
 
-// ProxyEventToHTTPRequest converts an API Gateway proxy event into an
-// http.Request object.
-// Returns the populated request with an additional two custom headers for the
-// stage variables and API Gateway context. To access these properties use
-// the GetAPIGatewayStageVars and GetAPIGatewayContext method of the RequestAccessor
-// object.
-func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequest) (*http.Request, error) {
-	decodedBody := []byte(req.Body)
-	if req.IsBase64Encoded {
-		base64Body, err := base64.StdEncoding.DecodeString(req.Body)
+func (r *RequestAccessor) body(body string, base64encoded bool) ([]byte, error) {
+	if base64encoded {
+		decoded, err := base64.StdEncoding.DecodeString(body)
 		if err != nil {
 			return nil, err
 		}
-		decodedBody = base64Body
+		return decoded, nil
+	}
+	return []byte(body), nil
+}
+
+func (r *RequestAccessor) request(body string, isbase64encoded bool, queryStringParameters map[string]string, requestPath string, method string, headers map[string]string, contextHeader string, ctxData interface{}) (*http.Request, error) {
+	decodedBody, err := r.body(body, isbase64encoded)
+	if err != nil {
+		return nil, err
 	}
 
 	queryString := ""
-	if len(req.QueryStringParameters) > 0 {
+	if len(queryStringParameters) > 0 {
 		queryString = "?"
 		queryCnt := 0
-		for q := range req.QueryStringParameters {
+		for q := range queryStringParameters {
 			if queryCnt > 0 {
 				queryString += "&"
 			}
-			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(req.QueryStringParameters[q])
+			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(queryStringParameters[q])
 			queryCnt++
 		}
 	}
 
-	path := req.Path
+	path := requestPath
 	if r.stripBasePath != "" && len(r.stripBasePath) > 1 {
 		if strings.HasPrefix(path, r.stripBasePath) {
 			path = strings.Replace(path, r.stripBasePath, "", 1)
@@ -140,41 +146,65 @@ func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequ
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
+
 	serverAddress := DefaultServerAddress
 	if customAddress, ok := os.LookupEnv(CustomHostVariable); ok {
 		serverAddress = customAddress
 	}
 
-	path = serverAddress + path
-
-	httpRequest, err := http.NewRequest(
-		strings.ToUpper(req.HTTPMethod),
-		path+queryString,
+	request, err :=  http.NewRequest(
+		strings.ToUpper(method),
+		serverAddress + path + queryString,
 		bytes.NewReader(decodedBody),
 	)
-
 	if err != nil {
-		fmt.Printf("Could not convert request %s:%s to http.Request\n", req.HTTPMethod, req.Path)
+		fmt.Printf("Could not convert request %s:%s to http.Request\n", method, requestPath)
 		log.Println(err)
 		return nil, err
 	}
 
-	for h := range req.Headers {
-		httpRequest.Header.Add(h, req.Headers[h])
-	}
-
-	apiGwContext, err := json.Marshal(req.RequestContext)
+	apiContext, err := json.Marshal(ctxData)
 	if err != nil {
 		log.Println("Could not Marshal API GW context for custom header")
 		return nil, err
 	}
-	stageVars, err := json.Marshal(req.StageVariables)
-	if err != nil {
-		log.Println("Could not marshal stage variables for custom header")
-		return nil, err
-	}
-	httpRequest.Header.Add(APIGwContextHeader, string(apiGwContext))
-	httpRequest.Header.Add(APIGwStageVarsHeader, string(stageVars))
+	request.Header.Add(contextHeader, string(apiContext))
 
-	return httpRequest, nil
+	for key, value := range headers {
+		request.Header.Add(key, value)
+	}
+
+	return request, nil
+}
+
+// ProxyEventToHTTPRequest converts an API Gateway proxy events and ALB target
+// group request events into an http.Request object.
+// Returns the populated request with an additional two custom headers for the
+// stage variables and API Gateway context. To access these properties use
+// the GetAPIGatewayStageVars and GetAPIGatewayContext method of the RequestAccessor
+// object.
+// TODO update docs to reference ALB methods (see TODOs further up in this file)
+func (r *RequestAccessor) ProxyEventToHTTPRequest(e interface{}) (*http.Request, error) {
+	switch event := e.(type) {
+	case events.APIGatewayProxyRequest:
+		request, err := r.request(event.Body, event.IsBase64Encoded, event.QueryStringParameters, event.Path, event.HTTPMethod, event.Headers, APIGwContextHeader, event.RequestContext)
+		if err != nil {
+			return nil, err
+		}
+
+		stageVars, err := json.Marshal(event.StageVariables)
+		if err != nil {
+			log.Println("Could not marshal stage variables for custom header")
+			return nil, err
+		}
+		request.Header.Add(APIGwStageVarsHeader, string(stageVars))
+		return request, err
+
+	case events.ALBTargetGroupRequest:
+		// TODO use proper contextHeader for FIXME in function args
+		return r.request(event.Body, event.IsBase64Encoded, event.QueryStringParameters, event.Path, event.HTTPMethod, event.Headers, "FIXME", event.RequestContext)
+
+	default:
+		return nil, fmt.Errorf("don't know how to handle type: %v", reflect.TypeOf(e))
+	}
 }
